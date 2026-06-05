@@ -45,23 +45,23 @@ except ImportError:
 #   https://opensource.adobe.com/dc-acrobat-sdk-docs/library/jsapiref/
 # ---------------------------------------------------------------------------
 WATERMARK_SETTINGS = {
-    "text": "OFFICIAL",          # the watermark text
-    "fontSize": 48,              # points
-    "opacity": 0.30,             # 0.0 (transparent) to 1.0 (opaque)
+    "text": "Official",          # the watermark text
+    "fontSize": 71,              # points
+    "opacity": 1.0,             # 0.0 (transparent) to 1.0 (opaque)
     "rotation": 45,              # degrees, counter-clockwise
     # Color is RGB, each channel 0.0-1.0. Example below is a muted red.
-    "color_r": 0.6,
-    "color_g": 0.0,
-    "color_b": 0.0,
+    "color_r": 0.83,
+    "color_g": 0.83,
+    "color_b": 0.83,
     # Horizontal alignment: 0=left, 1=center, 2=right
     "horizAlign": 1,
     # Vertical alignment: 0=top, 1=center, 2=bottom
     "vertAlign": 1,
     # Offsets in points from the chosen alignment anchor
-    "horizOffset": 0,
-    "vertOffset": 0,
+    "horizOffset": -.01,
+    "vertOffset": -3.5,
     # Font name as Acrobat expects it, e.g. "Helvetica", "Times-Roman", "Courier"
-    "fontName": "Helvetica",
+    "fontName": "Arial",
 }
 
 
@@ -75,19 +75,30 @@ NAME_LABEL_PATTERN = re.compile(
 
 
 def extract_student_name(pdf_path: Path) -> str | None:
-    """Return the raw student-name string found after the label, or None."""
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            for line in text.splitlines():
-                m = NAME_LABEL_PATTERN.search(line)
-                if m:
-                    name = m.group(1).strip()
-                    # Trim anything after a double-space or another label that
-                    # might appear on the same line.
-                    name = re.split(r"\s{2,}|\bDate\b|\bID\b", name)[0].strip()
-                    if name:
-                        return name
+            lines = [line.strip() for line in text.splitlines()]
+
+            for i, line in enumerate(lines):
+                if "Student Name" in line:
+
+                    # The actual student data is on the next line
+                    if i + 1 < len(lines):
+                        student_line = lines[i + 1]
+
+                        # Parse: "Smith, Jack Fynn 12 ..."
+                        m = re.match(
+                            r"^([^,]+),\s+([A-Za-z'-]+)",
+                            student_line
+                        )
+
+                        if m:
+                            last = m.group(1).strip()
+                            first = m.group(2).strip()
+
+                            return f"{first} {last}"
+
     return None
 
 
@@ -147,24 +158,19 @@ def process_with_acrobat(pdf_path: Path, output_path: Path, settings: dict):
 
     try:
         pdDoc = avDoc.GetPDDoc()
-        jsObject = pdDoc.GetJSObject()
-        # addWatermarkFromText is a method on the JS doc object.
-        js = build_watermark_js(settings)
-        # Execute via a small wrapper that the JS object understands.
-        # pywin32 lets us call defined methods, but for arbitrary JS we use
-        # the doc's built-in method directly:
-        jsObject.addWatermarkFromText(
-            settings["text"],          # cText
-            0,                          # nTextAlign (0=left within box)
-            settings["fontName"],       # cFont
-            settings["fontSize"],       # nFontSize
-            win32.VARIANT_BOOL if False else None,  # placeholder
-        )
-        # NOTE: the positional signature above is finicky across Acrobat
-        # versions. If it errors, use the named-object form by switching
-        # USE_NAMED_JS to True below.
+        pdDoc = avDoc.GetPDDoc()
 
-        pdDoc.Save(1, str(output_path))  # 1 = PDSaveFull
+        pdDoc.AddWatermarkFromText(
+            settings["text"],
+            0,   # rotation (ignored in some versions)
+            settings["fontSize"],
+            settings["opacity"],
+            False,  # isFront
+            False   # isOnPrint
+        )
+
+        pdDoc.Save(1, str(output_path))
+
     finally:
         avDoc.Close(True)
 
