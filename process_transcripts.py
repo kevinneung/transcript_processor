@@ -1,239 +1,237 @@
 """
 process_transcripts.py
 -----------------------
-Batch-process a folder of PDF transcripts on Windows, fully locally.
+Batch-process a folder of PDF transcripts. Fully local — no network calls,
+no Adobe Acrobat, no server.
 
-For each PDF in the folder it will:
-  1. Read the "Student Name:" value from the page text (no network calls).
-  2. Apply a text watermark via Adobe Acrobat COM automation,
-     reproducing your saved "official" preset settings (set them in
-     WATERMARK_SETTINGS below).
-  3. Save and rename the file to "Last, First, Final Transcript.pdf".
-
-Nothing is uploaded anywhere. Acrobat runs locally; pdfplumber reads locally.
+For each PDF in the target folder:
+  1. Extract the student name from a "Student Name:" label in the PDF text.
+  2. Add a light-gray "Official" watermark (45° diagonal, centered near the
+     bottom of each page) to every page.
+  3. Save to <folder>/output/ as "Last, First, Transcript.pdf"
 
 REQUIREMENTS
-  - Adobe Acrobat Pro (not Reader) installed and activated.
-  - pip install pywin32 pdfplumber
-  - Run from the same Windows user account that owns the Acrobat license.
+  pip install pymupdf
 
 USAGE
-  python process_transcripts.py "C:\\path\\to\\folder_of_pdfs"
-  python process_transcripts.py "C:\\path\\to\\folder" --dry-run
+  python process_transcripts.py <folder>
+  python process_transcripts.py <folder> --dry-run
+  python process_transcripts.py <folder> --overwrite
 """
 
 import argparse
+import platform
 import re
 import sys
-import time
 from pathlib import Path
 
-import pdfplumber
+import fitz  # pymupdf
 
-try:
-    import win32com.client as win32
-except ImportError:
-    win32 = None
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+WATERMARK_TEXT         = "Official"
+WATERMARK_COLOR        = (0.83, 0.83, 0.83)  # light gray (RGB 0-1)
+WATERMARK_ROTATION     = 45                   # degrees, counter-clockwise
+WATERMARK_FILL_OPACITY = 1.0                  # 100 %
+WATERMARK_SCALE        = 0.35                 # text width as fraction of page width
+WATERMARK_HORIZ_OFFSET = -0.1 * 72           # pts: negative = left of page center
+WATERMARK_VERT_OFFSET  =  3.5 * 72           # pts: positive = below page center
+
+OUTPUT_DIRNAME = "output"
+
+NAME_LABEL_PATTERN = re.compile(r"Student\s*Name\s*[:\-]\s*(.+)", re.IGNORECASE)
+NAME_INLINE_PATTERN = re.compile(r"^[A-Za-z\-']+,\s*[A-Za-z]")
 
 
 # ---------------------------------------------------------------------------
-# WATERMARK SETTINGS  --  fill these in to match your saved "official" preset.
-# Open Acrobat > Edit > Watermark > Add, load your "official" preset, and copy
-# each value from the dialog into the fields below.
-#
-# Acrobat JS reference for addWatermarkFromText parameters:
-#   https://opensource.adobe.com/dc-acrobat-sdk-docs/library/jsapiref/
+# Helpers
 # ---------------------------------------------------------------------------
-WATERMARK_SETTINGS = {
-    "text": "Official",          # the watermark text
-    "fontSize": 71,              # points
-    "opacity": 1.0,             # 0.0 (transparent) to 1.0 (opaque)
-    "rotation": 45,              # degrees, counter-clockwise
-    # Color is RGB, each channel 0.0-1.0. Example below is a muted red.
-    "color_r": 0.83,
-    "color_g": 0.83,
-    "color_b": 0.83,
-    # Horizontal alignment: 0=left, 1=center, 2=right
-    "horizAlign": 1,
-    # Vertical alignment: 0=top, 1=center, 2=bottom
-    "vertAlign": 1,
-    # Offsets in points from the chosen alignment anchor
-    "horizOffset": -.01,
-    "vertOffset": -3.5,
-    # Font name as Acrobat expects it, e.g. "Helvetica", "Times-Roman", "Courier"
-    "fontName": "Arial",
-}
+def extract_student_name(doc: fitz.Document) -> str | None:
+    # Strategy 1: look for "Student Name: ..." label on any page
+    for page in doc:
+        for line in page.get_text().splitlines():
+            m = NAME_LABEL_PATTERN.search(line)
+            if m:
+                name = m.group(1).strip()
+                name = re.split(r"\s{2,}|\bDate\b|\bID\b", name)[0].strip()
+                if name:
+                    return name
 
-
-# ---------------------------------------------------------------------------
-# Student-name extraction
-# ---------------------------------------------------------------------------
-# Matches "Student Name: John Smith" or "Student Name John Smith" etc.
-NAME_LABEL_PATTERN = re.compile(
-    r"Student\s*Name\s*[:\-]?\s*(.+)", re.IGNORECASE
-)
-
-
-def extract_student_name(pdf_path: Path) -> str | None:
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            lines = [line.strip() for line in text.splitlines()]
-
-            for i, line in enumerate(lines):
-                if "Student Name" in line:
-
-                    # The actual student data is on the next line
-                    if i + 1 < len(lines):
-                        student_line = lines[i + 1]
-
-                        # Parse: "Smith, Jack Fynn 12 ..."
-                        m = re.match(
-                            r"^([^,]+),\s+([A-Za-z'-]+)",
-                            student_line
-                        )
-
-                        if m:
-                            last = m.group(1).strip()
-                            first = m.group(2).strip()
-
-                            return f"{first} {last}"
+    # Strategy 2: on page 1, the line immediately before "Crs-ID" is the
+    # student name in "Last, First Middle" format (e.g. Palos Verdes transcripts)
+    lines = [l.strip() for l in doc[0].get_text().splitlines() if l.strip()]
+    for i, line in enumerate(lines):
+        if line == "Crs-ID" and i > 0:
+            candidate = lines[i - 1]
+            if NAME_INLINE_PATTERN.match(candidate):
+                return candidate
 
     return None
 
 
 def to_last_first(full_name: str) -> str:
-    """
-    Convert "First Middle Last" -> "Last, First".
-    Falls back gracefully on single-token names.
-    """
+    # "Last, First [Middle]" → "Last, First"
+    if "," in full_name:
+        last, rest = full_name.split(",", 1)
+        first = rest.strip().split()[0]
+        return f"{last.strip()}, {first}"
+    # "First [Middle] Last" → "Last, First"
     parts = full_name.split()
     if len(parts) == 1:
         return parts[0]
-    last = parts[-1]
-    first = parts[0]
-    return f"{last}, {first}"
+    return f"{parts[-1]}, {parts[0]}"
 
 
 def safe_filename(stem: str) -> str:
-    """Strip characters Windows disallows in filenames."""
     return re.sub(r'[<>:"/\\|?*]', "", stem).strip()
 
 
+def _find_arial():
+    """Return (fontname, fontfile_or_None): Arial if present on this OS, else helv."""
+    candidates = {
+        "Windows": [r"C:\Windows\Fonts\arial.ttf"],
+        "Darwin":  ["/Library/Fonts/Arial.ttf"],
+        "Linux":   [
+            "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ],
+    }
+    for path in candidates.get(platform.system(), []):
+        if Path(path).exists():
+            label = "Arial" if "arial" in path.lower() else "LiberSans"
+            return label, path
+    return "helv", None  # built-in Helvetica — visually equivalent to Arial
+
+
+def add_watermark(doc: fitz.Document) -> None:
+    fontname, fontfile = _find_arial()
+    for page in doc:
+        rect = page.rect
+
+        # Dynamic font size so text width == 35% of page width
+        if fontfile:
+            font_obj = fitz.Font(fontfile=fontfile)
+            unit_width = font_obj.text_length(WATERMARK_TEXT, fontsize=1)
+        else:
+            unit_width = fitz.get_text_length(
+                WATERMARK_TEXT, fontname=fontname, fontsize=1
+            )
+        fontsize = (rect.width * WATERMARK_SCALE) / unit_width
+        text_width = unit_width * fontsize
+
+        # Watermark center: -0.1" left of center, 3.5" below center
+        cx = rect.width  / 2 + WATERMARK_HORIZ_OFFSET
+        cy = rect.height / 2 + WATERMARK_VERT_OFFSET
+
+        # Insertion point: baseline-left of unrotated text, visually centered at (cx, cy)
+        origin = fitz.Point(cx - text_width / 2, cy + fontsize * 0.3)
+
+        page.insert_text(
+            origin,
+            WATERMARK_TEXT,
+            fontname=fontname,
+            fontfile=fontfile,
+            fontsize=fontsize,
+            color=WATERMARK_COLOR,
+            fill_opacity=WATERMARK_FILL_OPACITY,
+            morph=(fitz.Point(cx, cy), fitz.Matrix(WATERMARK_ROTATION)),
+            overlay=False,  # appear behind page content
+        )
+
+
 # ---------------------------------------------------------------------------
-# Acrobat COM automation
+# Per-file processing
 # ---------------------------------------------------------------------------
-def build_watermark_js(s: dict) -> str:
-    """Build the Acrobat document-level JavaScript to apply the watermark."""
-    return f"""
-    this.addWatermarkFromText({{
-        cText: {s['text']!r},
-        nTextAlign: app.constants.align.center,
-        nHorizAlign: {s['horizAlign']},
-        nVertAlign: {s['vertAlign']},
-        nFontSize: {s['fontSize']},
-        cFont: {s['fontName']!r},
-        aColor: ["RGB", {s['color_r']}, {s['color_g']}, {s['color_b']}],
-        nOpacity: {s['opacity']},
-        nRotation: {s['rotation']},
-        nHorizValue: {s['horizOffset']},
-        nVertValue: {s['vertOffset']},
-        bOnTop: true,
-        bOnScreen: true,
-        bOnPrint: true
-    }});
+def process_pdf(
+    pdf_path: Path, output_dir: Path, *, dry_run: bool, overwrite: bool
+) -> bool:
     """
-
-
-def process_with_acrobat(pdf_path: Path, output_path: Path, settings: dict):
-    """Open in Acrobat, apply watermark via JS, save to output_path."""
-    if win32 is None:
-        raise RuntimeError(
-            "pywin32 is not installed. Run: pip install pywin32"
-        )
-
-    avDoc = win32.Dispatch("AcroExch.AVDoc")
-    if not avDoc.Open(str(pdf_path), ""):
-        raise RuntimeError(f"Acrobat failed to open {pdf_path}")
-
+    Returns True if the file was processed (or would be in dry-run).
+    Raises ValueError on missing student name, fitz.FileDataError on corrupt PDF.
+    """
+    doc = fitz.open(str(pdf_path))
     try:
-        pdDoc = avDoc.GetPDDoc()
-        pdDoc = avDoc.GetPDDoc()
-
-        pdDoc.AddWatermarkFromText(
-            settings["text"],
-            0,   # rotation (ignored in some versions)
-            settings["fontSize"],
-            settings["opacity"],
-            False,  # isFront
-            False   # isOnPrint
-        )
-
-        pdDoc.Save(1, str(output_path))
-
+        name = extract_student_name(doc)
+        if not name:
+            raise ValueError("no 'Student Name' label found")
+        stem = safe_filename(f"{to_last_first(name)}, Transcript")
+        out_path = output_dir / f"{stem}.pdf"
+        print(f"   Student : {name}")
+        print(f"   Output  : {out_path.name}")
+        if dry_run:
+            print("   (dry run)\n")
+            return True
+        if out_path.exists() and not overwrite:
+            print("   SKIP    : output already exists (use --overwrite)\n")
+            return False
+        add_watermark(doc)
+        doc.save(str(out_path), garbage=4, deflate=True)
+        print("   Done.\n")
+        return True
     finally:
-        avDoc.Close(True)
+        doc.close()
 
 
 # ---------------------------------------------------------------------------
-# Main batch loop
+# Entry point
 # ---------------------------------------------------------------------------
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", help="Folder containing PDF transcripts")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Read names and show planned renames without touching Acrobat",
+        help="Show planned output names without writing files",
     )
     parser.add_argument(
-        "--suffix",
-        default="Final Transcript",
-        help='Filename suffix (default: "Final Transcript")',
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing files in output/",
     )
     args = parser.parse_args()
 
     folder = Path(args.folder)
     if not folder.is_dir():
-        sys.exit(f"Not a folder: {folder}")
+        sys.exit(f"Error: not a directory: {folder}")
 
     pdfs = sorted(folder.glob("*.pdf"))
     if not pdfs:
-        sys.exit(f"No PDFs found in {folder}")
+        sys.exit(f"No PDF files found in {folder}")
 
-    print(f"Found {len(pdfs)} PDF(s).\n")
+    output_dir = folder / OUTPUT_DIRNAME
+    if not args.dry_run:
+        output_dir.mkdir(exist_ok=True)
 
+    print(f"Found {len(pdfs)} PDF(s) in {folder}")
+    if args.dry_run:
+        print("Dry run — no files will be written.\n")
+
+    skipped = []
     for i, pdf_path in enumerate(pdfs, 1):
         print(f"[{i}/{len(pdfs)}] {pdf_path.name}")
-
-        name = extract_student_name(pdf_path)
-        if not name:
-            print("   !! Could not find a Student Name. Skipping.\n")
-            continue
-
-        last_first = to_last_first(name)
-        new_stem = safe_filename(f"{last_first}, {args.suffix}")
-        output_path = pdf_path.with_name(new_stem + ".pdf")
-
-        print(f"   Student: {name}")
-        print(f"   Rename : {output_path.name}")
-
-        if args.dry_run:
-            print("   (dry run, no changes)\n")
-            continue
-
         try:
-            # Apply watermark to a temp output, then remove the original.
-            tmp_out = pdf_path.with_name(pdf_path.stem + "__wm.pdf")
-            process_with_acrobat(pdf_path, tmp_out, WATERMARK_SETTINGS)
-            time.sleep(0.5)  # let Acrobat release the file handle
-            pdf_path.unlink()
-            tmp_out.rename(output_path)
-            print("   Done.\n")
+            ok = process_pdf(
+                pdf_path, output_dir, dry_run=args.dry_run, overwrite=args.overwrite
+            )
+            if not ok:
+                skipped.append(pdf_path.name)
+        except ValueError as e:
+            print(f"   SKIP: {e}\n")
+            skipped.append(pdf_path.name)
+        except fitz.FileDataError as e:
+            print(f"   ERROR (corrupt PDF): {e}\n")
+            skipped.append(pdf_path.name)
         except Exception as e:
-            print(f"   !! Error: {e}\n")
+            print(f"   ERROR: {e}\n")
+            skipped.append(pdf_path.name)
 
-    print("All files processed.")
+    processed = len(pdfs) - len(skipped)
+    print(f"Finished. {processed}/{len(pdfs)} file(s) processed successfully.")
+    if skipped:
+        print(f"\n{len(skipped)} file(s) skipped or errored:")
+        for s in skipped:
+            print(f"  - {s}")
 
 
 if __name__ == "__main__":
