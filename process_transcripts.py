@@ -47,20 +47,20 @@ NAME_INLINE_PATTERN = re.compile(r"^[A-Za-z\-']+,\s*[A-Za-z]")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def extract_student_name(doc: fitz.Document) -> str | None:
-    # Strategy 1: look for "Student Name: ..." label on any page
-    for page in doc:
-        for line in page.get_text().splitlines():
-            m = NAME_LABEL_PATTERN.search(line)
-            if m:
-                name = m.group(1).strip()
-                name = re.split(r"\s{2,}|\bDate\b|\bID\b", name)[0].strip()
-                if name:
-                    return name
+def get_page_student_name(page: fitz.Page) -> str | None:
+    """Return the student name if this page starts a new student section, else None."""
+    lines = [l.strip() for l in page.get_text().splitlines() if l.strip()]
 
-    # Strategy 2: on page 1, the line immediately before "Crs-ID" is the
-    # student name in "Last, First Middle" format (e.g. Palos Verdes transcripts)
-    lines = [l.strip() for l in doc[0].get_text().splitlines() if l.strip()]
+    # Strategy 1: "Student Name: ..." label
+    for line in lines:
+        m = NAME_LABEL_PATTERN.search(line)
+        if m:
+            name = m.group(1).strip()
+            name = re.split(r"\s{2,}|\bDate\b|\bID\b", name)[0].strip()
+            if name:
+                return name
+
+    # Strategy 2: line immediately before "Crs-ID" in "Last, First" format
     for i, line in enumerate(lines):
         if line == "Crs-ID" and i > 0:
             candidate = lines[i - 1]
@@ -68,6 +68,37 @@ def extract_student_name(doc: fitz.Document) -> str | None:
                 return candidate
 
     return None
+
+
+def find_student_sections(doc: fitz.Document) -> list[tuple[str, list[int]]]:
+    """
+    Return a list of (name, [page_indices]) — one entry per student found in the doc.
+    A new section starts only when the detected name differs from the current section's
+    name, so continuation pages that repeat the header are grouped correctly.
+    Pages before the first detected name are prepended to the first student's pages.
+    """
+    sections: list[list] = []   # each entry: [name, [page_indices]]
+    leading: list[int] = []
+
+    for page_num in range(len(doc)):
+        name = get_page_student_name(doc[page_num])
+        if name:
+            current_name = sections[-1][0] if sections else None
+            if name != current_name:
+                # Genuinely new student
+                sections.append([name, [page_num]])
+            else:
+                # Same student — continuation page with a repeated header
+                sections[-1][1].append(page_num)
+        elif sections:
+            sections[-1][1].append(page_num)
+        else:
+            leading.append(page_num)
+
+    if leading and sections:
+        sections[0][1] = leading + sections[0][1]
+
+    return [(name, pages) for name, pages in sections]
 
 
 def to_last_first(full_name: str) -> str:
@@ -145,30 +176,50 @@ def add_watermark(doc: fitz.Document) -> None:
 # ---------------------------------------------------------------------------
 def process_pdf(
     pdf_path: Path, output_dir: Path, *, dry_run: bool, overwrite: bool
-) -> bool:
+) -> tuple[int, int]:
     """
-    Returns True if the file was processed (or would be in dry-run).
-    Raises ValueError on missing student name, fitz.FileDataError on corrupt PDF.
+    Split pdf_path by student and write one output PDF per student.
+    Returns (processed_count, skipped_count).
+    Raises ValueError if no students found, fitz.FileDataError on corrupt PDF.
     """
     doc = fitz.open(str(pdf_path))
     try:
-        name = extract_student_name(doc)
-        if not name:
+        sections = find_student_sections(doc)
+        if not sections:
             raise ValueError("no 'Student Name' label found")
-        stem = safe_filename(f"{to_last_first(name)}, Transcript")
-        out_path = output_dir / f"{stem}.pdf"
-        print(f"   Student : {name}")
-        print(f"   Output  : {out_path.name}")
-        if dry_run:
-            print("   (dry run)\n")
-            return True
-        if out_path.exists() and not overwrite:
-            print("   SKIP    : output already exists (use --overwrite)\n")
-            return False
-        add_watermark(doc)
-        doc.save(str(out_path), garbage=4, deflate=True)
-        print("   Done.\n")
-        return True
+
+        processed = skipped = 0
+        for name, page_indices in sections:
+            stem = safe_filename(f"{to_last_first(name)}, Transcript")
+            out_path = output_dir / f"{stem}.pdf"
+            print(f"   Student : {name}  ({len(page_indices)} page(s))")
+            print(f"   Output  : {out_path.name}")
+            if dry_run:
+                print("   (dry run)")
+                processed += 1
+                continue
+            if out_path.exists() and not overwrite:
+                print("   SKIP    : output already exists (use --overwrite)")
+                skipped += 1
+                continue
+
+            # Build a sub-document for this student and watermark it
+            subdoc = fitz.open()
+            subdoc.insert_pdf(doc, from_page=page_indices[0], to_page=page_indices[-1])
+            # Handle non-contiguous pages (rare, but safe)
+            if page_indices != list(range(page_indices[0], page_indices[-1] + 1)):
+                subdoc = fitz.open()
+                for pg in page_indices:
+                    subdoc.insert_pdf(doc, from_page=pg, to_page=pg)
+
+            add_watermark(subdoc)
+            subdoc.save(str(out_path), garbage=4, deflate=True)
+            subdoc.close()
+            print("   Done.")
+            processed += 1
+
+        print()
+        return processed, skipped
     finally:
         doc.close()
 
@@ -207,30 +258,34 @@ def main() -> None:
     if args.dry_run:
         print("Dry run — no files will be written.\n")
 
-    skipped = []
+    total_processed = total_skipped = 0
+    errored = []
     for i, pdf_path in enumerate(pdfs, 1):
         print(f"[{i}/{len(pdfs)}] {pdf_path.name}")
         try:
-            ok = process_pdf(
+            done, skipped = process_pdf(
                 pdf_path, output_dir, dry_run=args.dry_run, overwrite=args.overwrite
             )
-            if not ok:
-                skipped.append(pdf_path.name)
+            total_processed += done
+            total_skipped += skipped
         except ValueError as e:
             print(f"   SKIP: {e}\n")
-            skipped.append(pdf_path.name)
+            errored.append(pdf_path.name)
         except fitz.FileDataError as e:
             print(f"   ERROR (corrupt PDF): {e}\n")
-            skipped.append(pdf_path.name)
+            errored.append(pdf_path.name)
         except Exception as e:
             print(f"   ERROR: {e}\n")
-            skipped.append(pdf_path.name)
+            errored.append(pdf_path.name)
 
-    processed = len(pdfs) - len(skipped)
-    print(f"Finished. {processed}/{len(pdfs)} file(s) processed successfully.")
-    if skipped:
-        print(f"\n{len(skipped)} file(s) skipped or errored:")
-        for s in skipped:
+    print(
+        f"Finished. {total_processed} student PDF(s) written, "
+        f"{total_skipped} skipped (already exist), "
+        f"{len(errored)} input file(s) errored."
+    )
+    if errored:
+        print(f"\nFiles with errors:")
+        for s in errored:
             print(f"  - {s}")
 
 
