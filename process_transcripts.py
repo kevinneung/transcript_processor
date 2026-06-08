@@ -40,15 +40,16 @@ WATERMARK_VERT_OFFSET  =  3.5 * 72           # pts: positive = below page center
 
 OUTPUT_DIRNAME = "output"
 
-NAME_LABEL_PATTERN = re.compile(r"Student\s*Name\s*[:\-]\s*(.+)", re.IGNORECASE)
+NAME_LABEL_PATTERN  = re.compile(r"Student\s*Name\s*[:\-]\s*(.+)", re.IGNORECASE)
 NAME_INLINE_PATTERN = re.compile(r"^[A-Za-z\-']+,\s*[A-Za-z]")
+STATE_ID_PATTERN    = re.compile(r"State\s*ID\s*#?\s*[:\-]?\s*(\w+)", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def get_page_student_name(page: fitz.Page) -> str | None:
-    """Return the student name if this page starts a new student section, else None."""
+    """Return the student name if this page has a student header, else None."""
     lines = [l.strip() for l in page.get_text().splitlines() if l.strip()]
 
     # Strategy 1: "Student Name: ..." label
@@ -70,52 +71,121 @@ def get_page_student_name(page: fitz.Page) -> str | None:
     return None
 
 
-def find_student_sections(doc: fitz.Document) -> list[tuple[str, list[int]]]:
+def get_page_state_id(page: fitz.Page) -> str | None:
+    """Return the State ID found on this page, else None."""
+    for line in page.get_text().splitlines():
+        m = STATE_ID_PATTERN.search(line)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def find_student_sections(doc: fitz.Document) -> list[tuple[str, str | None, list[int]]]:
     """
-    Return a list of (name, [page_indices]) — one entry per student found in the doc.
-    A new section starts only when the detected name differs from the current section's
-    name, so continuation pages that repeat the header are grouped correctly.
-    Pages before the first detected name are prepended to the first student's pages.
+    Return a list of (name, state_id, [page_indices]) — one entry per student.
+    A new section starts when the name differs, or when the same name appears with
+    a different non-None State ID (handles same-name students).
+    Continuation pages that repeat the header are grouped with the current section.
     """
-    sections: list[list] = []   # each entry: [name, [page_indices]]
+    sections: list[list] = []   # [name, state_id, [page_indices]]
     leading: list[int] = []
 
     for page_num in range(len(doc)):
-        name = get_page_student_name(doc[page_num])
+        page = doc[page_num]
+        name = get_page_student_name(page)
+        sid  = get_page_state_id(page)
+
         if name:
             current_name = sections[-1][0] if sections else None
-            if name != current_name:
-                # Genuinely new student
-                sections.append([name, [page_num]])
+            current_sid  = sections[-1][1] if sections else None
+            same_name    = (name == current_name)
+            sid_conflict = (sid is not None and current_sid is not None and sid != current_sid)
+            if not same_name or sid_conflict:
+                sections.append([name, sid, [page_num]])
             else:
-                # Same student — continuation page with a repeated header
-                sections[-1][1].append(page_num)
-        elif sections:
-            sections[-1][1].append(page_num)
+                # Continuation page — absorb any newly seen state_id
+                if sid and not sections[-1][1]:
+                    sections[-1][1] = sid
+                sections[-1][2].append(page_num)
         else:
-            leading.append(page_num)
+            if sections:
+                if sid and not sections[-1][1]:
+                    sections[-1][1] = sid
+                sections[-1][2].append(page_num)
+            else:
+                leading.append(page_num)
 
     if leading and sections:
-        sections[0][1] = leading + sections[0][1]
+        sections[0][2] = leading + sections[0][2]
 
-    return [(name, pages) for name, pages in sections]
+    return [(name, sid, pages) for name, sid, pages in sections]
+
+
+def parse_name_parts(full_name: str) -> tuple[str, str, str]:
+    """Return (last, first, middle) from 'Last, First Middle' or 'First [Middle] Last'."""
+    if "," in full_name:
+        last, rest = full_name.split(",", 1)
+        parts = rest.strip().split()
+        return last.strip(), (parts[0] if parts else ""), (parts[1] if len(parts) > 1 else "")
+    parts = full_name.split()
+    if len(parts) == 1:
+        return parts[0], "", ""
+    if len(parts) == 2:
+        return parts[-1], parts[0], ""
+    return parts[-1], parts[0], parts[1]
 
 
 def to_last_first(full_name: str) -> str:
-    # "Last, First [Middle]" → "Last, First"
-    if "," in full_name:
-        last, rest = full_name.split(",", 1)
-        first = rest.strip().split()[0]
-        return f"{last.strip()}, {first}"
-    # "First [Middle] Last" → "Last, First"
-    parts = full_name.split()
-    if len(parts) == 1:
-        return parts[0]
-    return f"{parts[-1]}, {parts[0]}"
+    last, first, _ = parse_name_parts(full_name)
+    return f"{last}, {first}" if first else last
+
+
+def to_last_first_middle(full_name: str) -> str:
+    last, first, middle = parse_name_parts(full_name)
+    if not first:
+        return last
+    if middle:
+        return f"{last}, {first} {middle[0].upper()}"
+    return f"{last}, {first}"
 
 
 def safe_filename(stem: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', "", stem).strip()
+
+
+def resolve_output_stems(sections: list[tuple[str, str | None, list[int]]]) -> list[str]:
+    """
+    Return one unique filename stem per section.
+    Collision resolution order:
+      1. "Last, First, Transcript"
+      2. Add middle initial if Last+First collides: "Last, First M, Transcript"
+      3. Add numeric suffix if still colliding: "Last, First M, Transcript-1", "-2", …
+    """
+    from collections import Counter
+
+    # Pass 1: base stems
+    stems = [safe_filename(f"{to_last_first(name)}, Transcript") for name, _, _ in sections]
+
+    # Pass 2: upgrade to middle initial wherever base stem collides
+    counts = Counter(stems)
+    stems = [
+        safe_filename(f"{to_last_first_middle(name)}, Transcript") if counts[stem] > 1 else stem
+        for stem, (name, _, _) in zip(stems, sections)
+    ]
+
+    # Pass 3: numeric suffix for any remaining collisions
+    counts2 = Counter(stems)
+    seen: dict[str, int] = {}
+    final = []
+    for stem in stems:
+        if counts2[stem] > 1:
+            n = seen.get(stem, 0) + 1
+            seen[stem] = n
+            final.append(f"{stem}-{n}")
+        else:
+            final.append(stem)
+
+    return final
 
 
 def _find_arial():
@@ -188,11 +258,12 @@ def process_pdf(
         if not sections:
             raise ValueError("no 'Student Name' label found")
 
+        stems = resolve_output_stems(sections)
         processed = skipped = 0
-        for name, page_indices in sections:
-            stem = safe_filename(f"{to_last_first(name)}, Transcript")
+        for (name, sid, page_indices), stem in zip(sections, stems):
             out_path = output_dir / f"{stem}.pdf"
-            print(f"   Student : {name}  ({len(page_indices)} page(s))")
+            sid_label = f"  [ID: {sid}]" if sid else ""
+            print(f"   Student : {name}{sid_label}  ({len(page_indices)} page(s))")
             print(f"   Output  : {out_path.name}")
             if dry_run:
                 print("   (dry run)")
